@@ -50,16 +50,51 @@ def build():
     cve_records = []
     cwe_links = []
     seen_cwes = {}
-    for i, cve_id in enumerate(cve_ids):
-        print(f"[NVD] {i+1}/{len(cve_ids)} {cve_id}")
+    failed_ids = []
+
+    def try_fetch(cve_id):
         item = fetch_nvd.fetch_by_id(cve_id)
         if not item:
+            return None
+        return fetch_nvd.normalize(item)
+
+    for i, cve_id in enumerate(cve_ids):
+        print(f"[NVD] {i+1}/{len(cve_ids)} {cve_id}")
+        norm = try_fetch(cve_id)
+        if norm is None:
+            print(f"[NVD] WARNING: {cve_id} failed on first attempt, will retry at end")
+            failed_ids.append(cve_id)
             continue
-        norm = fetch_nvd.normalize(item)
         cve_records.append(norm)
         for cwe_id in norm["cwes"]:
-            seen_cwes.setdefault(cwe_id, cwe_id)  # name backfilled later if known
+            seen_cwes.setdefault(cwe_id, cwe_id)
             cwe_links.append((cve_id, cwe_id))
+
+    # Retry pass: transient NVD failures (rate limits, brief timeouts) are common
+    # enough at this call volume that a single retry pass after the main loop
+    # recovers most of them, rather than silently shipping an incomplete database.
+    if failed_ids:
+        print(f"\n[NVD] retrying {len(failed_ids)} failed CVE(s): {failed_ids}")
+        still_failed = []
+        for cve_id in failed_ids:
+            time.sleep(fetch_nvd.SLEEP_SECONDS)
+            norm = try_fetch(cve_id)
+            if norm is None:
+                still_failed.append(cve_id)
+                continue
+            print(f"[NVD] retry succeeded: {cve_id}")
+            cve_records.append(norm)
+            for cwe_id in norm["cwes"]:
+                seen_cwes.setdefault(cwe_id, cwe_id)
+                cwe_links.append((cve_id, cwe_id))
+        failed_ids = still_failed
+
+    # --- Clear summary: never let a silent drop hide in a wall of log lines ---
+    print(f"\n[NVD] {len(cve_records)}/{len(cve_ids)} CVEs successfully fetched")
+    if failed_ids:
+        print(f"[NVD] WARNING: {len(failed_ids)} CVE(s) permanently failed and are "
+              f"MISSING from this build: {failed_ids}")
+        print(f"[NVD] These will be retried automatically on the next nightly run.")
 
     # --- EPSS (bulk, then filter) ---
     print("[EPSS] fetching bulk score file...")
@@ -127,6 +162,8 @@ def build():
         "version": time.strftime("%Y%m%d%H%M%S", time.gmtime()),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "cve_count": len(cve_records),
+        "cve_ids_requested": len(cve_ids),
+        "cve_ids_missing": failed_ids,
     }
     with open(VERSION_PATH, "w") as f:
         json.dump(version, f, indent=2)

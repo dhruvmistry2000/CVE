@@ -33,8 +33,9 @@ def _request(params, retries=3):
             print(f"[NVD] rate limited (HTTP {r.status_code}), backing off...")
             time.sleep(SLEEP_SECONDS * (attempt + 1))
             continue
-        print(f"[NVD] HTTP {r.status_code} for params={params}")
+        print(f"[NVD] WARNING: HTTP {r.status_code} for params={params}")
         return None
+    print(f"[NVD] WARNING: exhausted {retries} retries for params={params}")
     return None
 
 
