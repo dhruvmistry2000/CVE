@@ -97,32 +97,62 @@ def build():
         print(f"[NVD] These will be retried automatically on the next nightly run.")
 
     # --- EPSS (bulk, then filter) ---
-    print("[EPSS] fetching bulk score file...")
-    epss_all = fetch_epss.fetch_all()
-    epss_rows = [
-        (cid, *epss_all[cid]) for cid in cve_ids if cid in epss_all
-    ]
-    print(f"[EPSS] matched {len(epss_rows)} of {len(cve_ids)} tracked CVEs")
+    epss_rows = []
+    epss_ok = False
+    try:
+        print("[EPSS] fetching bulk score file...")
+        epss_all = fetch_epss.fetch_all()
+        epss_rows = [(cid, *epss_all[cid]) for cid in cve_ids if cid in epss_all]
+        epss_ok = True
+        print(f"[EPSS] matched {len(epss_rows)} of {len(cve_ids)} tracked CVEs")
+    except Exception as e:
+        print(f"[EPSS] WARNING: bulk fetch failed ({e}), keeping previous EPSS data")
 
     # --- CISA KEV (bulk, then filter) ---
-    print("[KEV] fetching catalog...")
-    kev_all = fetch_kev.fetch_all()
-    kev_rows = [(cid, "cisa_kev", f"added {kev_all[cid]}") for cid in cve_ids if cid in kev_all]
-    print(f"[KEV] {len(kev_rows)} tracked CVEs are known-exploited")
+    kev_rows = []
+    kev_ok = False
+    try:
+        print("[KEV] fetching catalog...")
+        kev_all = fetch_kev.fetch_all()
+        kev_rows = [(cid, "cisa_kev", f"added {kev_all[cid]}") for cid in cve_ids if cid in kev_all]
+        kev_ok = True
+        print(f"[KEV] {len(kev_rows)} tracked CVEs are known-exploited")
+    except Exception as e:
+        print(f"[KEV] WARNING: catalog fetch failed ({e}), keeping previous KEV data")
 
     # --- Distro status ---
-    print("[Debian] fetching tracker...")
-    debian_rows = fetch_debian.rows_for(cve_ids, DEBIAN_RELEASES)
-    print("[Ubuntu] fetching per-CVE status...")
-    ubuntu_rows = fetch_ubuntu.rows_for(cve_ids, UBUNTU_RELEASES)
+    debian_rows = []
+    debian_ok = False
+    try:
+        print("[Debian] fetching tracker...")
+        debian_rows = fetch_debian.rows_for(cve_ids, DEBIAN_RELEASES)
+        debian_ok = True
+    except Exception as e:
+        print(f"[Debian] WARNING: tracker fetch failed ({e}), keeping previous Debian data")
+
+    ubuntu_rows = []
+    ubuntu_ok = False
+    try:
+        print("[Ubuntu] fetching per-CVE status...")
+        ubuntu_rows = fetch_ubuntu.rows_for(cve_ids, UBUNTU_RELEASES)
+        ubuntu_ok = True
+    except Exception as e:
+        print(f"[Ubuntu] WARNING: tracker fetch failed ({e}), keeping previous Ubuntu data")
 
     # --- Write to SQLite ---
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    # IMPORTANT: we do NOT delete DB_PATH here. The workflow restores the
+    # previously-published database as a starting point before this script
+    # runs (see .github/workflows/update-cve-db.yml, "Restore previous
+    # database as baseline"). We only ever INSERT OR REPLACE rows we
+    # successfully re-fetched this run - a CVE that fails to fetch tonight
+    # (NVD rate limit, transient timeout) simply keeps last night's data
+    # instead of vanishing from the live site.
     conn = sqlite3.connect(DB_PATH)
     with open(SCHEMA_PATH) as f:
-        conn.executescript(f.read())
+        conn.executescript(f.read())  # every statement is IF NOT EXISTS / idempotent
     cur = conn.cursor()
+
+    fetched_ids = [r["cve_id"] for r in cve_records]
 
     for r in cve_records:
         cur.execute(
@@ -130,28 +160,43 @@ def build():
             (r["cve_id"], r["state"], r["published"], r["last_modified"],
              r["description"], r["severity"], r["cvss_score"], r["cvss_vector"], r["assigner"])
         )
+        # clear this CVE's old FTS row and CWE links before re-inserting,
+        # so a CVE re-fetched on a later run doesn't accumulate duplicates
+        cur.execute("DELETE FROM cve_fts WHERE cve_id=?", (r["cve_id"],))
         if r["description"]:
             cur.execute(
                 "INSERT INTO cve_fts(cve_id, description) VALUES (?,?)",
                 (r["cve_id"], r["description"])
             )
+        cur.execute("DELETE FROM cve_cwes WHERE cve_id=?", (r["cve_id"],))
 
     for cwe_id in seen_cwes:
         cur.execute("INSERT OR IGNORE INTO cwes VALUES (?,?)", (cwe_id, cwe_id))
     for cve_id, cwe_id in cwe_links:
         cur.execute("INSERT OR IGNORE INTO cve_cwes VALUES (?,?)", (cve_id, cwe_id))
 
-    for row in ubuntu_rows + debian_rows:
-        cur.execute(
-            "INSERT OR REPLACE INTO distro_status VALUES (?,?,?,?,?,?)",
-            (row["cve_id"], row["distro"], row["release"], row["package"], row["status"], row["fixed_version"])
-        )
+    if debian_ok or ubuntu_ok:
+        if debian_ok:
+            cur.executemany("DELETE FROM distro_status WHERE cve_id=? AND distro='debian'",
+                             [(cid,) for cid in cve_ids])
+        if ubuntu_ok:
+            cur.executemany("DELETE FROM distro_status WHERE cve_id=? AND distro='ubuntu'",
+                             [(cid,) for cid in cve_ids])
+        for row in ubuntu_rows + debian_rows:
+            cur.execute(
+                "INSERT OR REPLACE INTO distro_status VALUES (?,?,?,?,?,?)",
+                (row["cve_id"], row["distro"], row["release"], row["package"], row["status"], row["fixed_version"])
+            )
 
-    for row in kev_rows:
-        cur.execute("INSERT INTO exploits VALUES (?,?,?)", row)
+    if kev_ok:
+        cur.executemany("DELETE FROM exploits WHERE cve_id=? AND source='cisa_kev'",
+                         [(cid,) for cid in cve_ids])
+        for row in kev_rows:
+            cur.execute("INSERT INTO exploits VALUES (?,?,?)", row)
 
-    for cid, score, pct, date in epss_rows:
-        cur.execute("INSERT OR REPLACE INTO epss_scores VALUES (?,?,?,?)", (cid, score, pct, date))
+    if epss_ok:
+        for cid, score, pct, date in epss_rows:
+            cur.execute("INSERT OR REPLACE INTO epss_scores VALUES (?,?,?,?)", (cid, score, pct, date))
 
     conn.commit()
     conn.close()
