@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>CVE Scanner</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+<style>
+:root{
+  --bg:#0d1117;--surface:#161b22;--surface2:#1f2937;
+  --border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;
+  --font-sans:'IBM Plex Sans',sans-serif;--font-mono:'IBM Plex Mono',monospace
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font-sans);font-size:15px;line-height:1.6}
+.wrap{max-width:900px;margin:0 auto;padding:2rem 1.5rem}
+.title{font-family:var(--font-mono);font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:.6rem}
+h1{font-family:var(--font-mono);font-size:1.7rem;margin-bottom:.8rem}
+.status{font-family:var(--font-mono);font-size:12px;padding:.6rem .9rem;border-radius:6px;margin-bottom:1.2rem;border:1px solid var(--border)}
+.status.loading{color:#fcd34d;background:#1f1a0a}
+.status.ready{color:#86efac;background:#0d1f0d}
+.status.error{color:#fca5a5;background:#1f0d0d}
+.searchbar{display:flex;gap:.6rem;margin-bottom:.6rem}
+.searchbar input{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:.7rem 1rem;font-size:14px;font-family:var(--font-mono)}
+.searchbar input:focus{outline:none;border-color:var(--accent)}
+.searchbar input:disabled{opacity:.5}
+.hint{font-size:12px;color:var(--muted);margin-bottom:1.5rem;font-family:var(--font-mono)}
+.results{display:flex;flex-direction:column;gap:.6rem;margin-bottom:2rem}
+.row{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem 1.2rem;cursor:pointer;transition:border-color .15s}
+.row:hover{border-color:var(--accent)}
+.row.active{border-color:var(--accent);background:var(--surface2)}
+.row-top{display:flex;justify-content:space-between;align-items:center;gap:1rem;margin-bottom:.4rem}
+.cve-id{font-family:var(--font-mono);font-weight:600;font-size:14px}
+.badges{display:flex;gap:.4rem;flex-wrap:wrap}
+.badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:10px;font-weight:600;font-family:var(--font-mono);letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
+.desc{font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.detail{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.5rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-bottom:1.25rem}
+.cell{background:var(--surface2);padding:.7rem .9rem}
+.cell-label{font-size:10px;font-family:var(--font-mono);color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem}
+.cell-val{font-weight:600;font-size:14px}
+.desc-block{font-size:14px;color:#cdd9e5;line-height:1.8;border-left:3px solid var(--accent);padding-left:1rem;margin-bottom:1.25rem}
+.section-h{font-size:10px;font-family:var(--font-mono);color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:1.25rem 0 .5rem}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:.5rem .7rem;font-family:var(--font-mono);font-size:10.5px;text-transform:uppercase;color:var(--muted);background:var(--surface2);border-bottom:1px solid var(--border)}
+td{padding:.5rem .7rem;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+code{font-family:var(--font-mono);font-size:12px;background:var(--surface2);padding:1px 6px;border-radius:4px;color:#79c0ff}
+.kev-note{background:#1a0a0a;border:1px solid #7f1d1d;border-left:4px solid #ef4444;border-radius:8px;padding:.8rem 1rem;margin-bottom:1.25rem;font-size:13px;color:#fca5a5}
+.empty{color:var(--muted);font-size:13px;padding:2rem;text-align:center;font-family:var(--font-mono)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="title">CVE aggregator</div>
+  <h1>Search the CVE database</h1>
+  <div id="status" class="status loading">Checking for the latest database...</div>
+  <div class="searchbar">
+    <input id="q" type="text" placeholder="Search description, package, or CVE id..." disabled/>
+  </div>
+  <div class="hint">Data refreshes nightly via GitHub Actions. Search runs entirely in your browser via sql.js - nothing is sent to any server.</div>
+  <div id="results" class="results"></div>
+  <div id="detail"></div>
+</div>
+
+<script>
+const SEV_COLOR = {
+  CRITICAL:["#7f1d1d","#fca5a5"], HIGH:["#7c2d12","#fdba74"],
+  MEDIUM:["#713f12","#fcd34d"], LOW:["#14532d","#86efac"]
+};
+function sevBadge(s){const c=SEV_COLOR[s]||["#1e3a5f","#93c5fd"];return `<span class="badge" style="background:${c[1]};color:${c[0]}">${s||'UNKNOWN'}</span>`}
+function epssBadge(score){
+  const pct=(score*100).toFixed(1);
+  const c = score>0.5 ? ["#7f1d1d","#fca5a5"] : score>0.1 ? ["#7c2d12","#fdba74"] : ["#14532d","#86efac"];
+  return `<span class="badge" style="background:${c[1]};color:${c[0]}">EPSS ${pct}%</span>`;
+}
+function statusBadge(st){
+  const sl=(st||"").toLowerCase();
+  if(sl.includes("resolved")||sl.includes("released")) return `<span class="badge" style="background:#bbf7d0;color:#14532d">${st}</span>`;
+  if(sl.includes("open")||sl.includes("needed")||sl.includes("unfixed")) return `<span class="badge" style="background:#fde68a;color:#7c2d12">${st}</span>`;
+  return `<span class="badge" style="background:#374151;color:#9ca3af">${st}</span>`;
+}
+
+let db = null;
+let activeId = null;
+
+function rowsFromStmt(stmt){
+  const out = [];
+  while(stmt.step()) out.push(stmt.getAsObject());
+  stmt.free();
+  return out;
+}
+
+function search(term){
+  // NOTE: FTS5's MATCH cannot be combined with OR in a single WHERE clause
+  // (SQLite raises "unable to use function MATCH in the requested context").
+  // A UNION of two separate queries -- one FTS search, one plain CVE-ID
+  // match -- avoids that restriction and lets a search work whether the
+  // user typed a keyword or a CVE ID.
+  const sql = `
+SELECT cve_id, severity, cvss_score, description, epss_score, in_kev FROM (
+  SELECT c.cve_id, c.severity, c.cvss_score, c.description, e.epss_score,
+         EXISTS(SELECT 1 FROM exploits x WHERE x.cve_id=c.cve_id AND x.source='cisa_kev') AS in_kev
+  FROM cve_fts f
+  JOIN cves c ON c.cve_id = f.cve_id
+  LEFT JOIN epss_scores e ON e.cve_id = c.cve_id
+  WHERE cve_fts MATCH ?
+  UNION
+  SELECT c.cve_id, c.severity, c.cvss_score, c.description, e.epss_score,
+         EXISTS(SELECT 1 FROM exploits x WHERE x.cve_id=c.cve_id AND x.source='cisa_kev') AS in_kev
+  FROM cves c
+  LEFT JOIN epss_scores e ON e.cve_id = c.cve_id
+  WHERE c.cve_id LIKE ?
+)
+ORDER BY in_kev DESC, epss_score DESC
+LIMIT 50;`.trim();
+  const stmt = db.prepare(sql);
+  stmt.bind([term + "*", "%" + term + "%"]);
+  return rowsFromStmt(stmt);
+}
+
+function detailQuery(id){
+  const cwes = rowsFromStmt((()=>{const s=db.prepare("SELECT w.cwe_id, w.name FROM cve_cwes cc JOIN cwes w ON w.cwe_id=cc.cwe_id WHERE cc.cve_id=?");s.bind([id]);return s;})());
+  const exploits = rowsFromStmt((()=>{const s=db.prepare("SELECT source, reference FROM exploits WHERE cve_id=?");s.bind([id]);return s;})());
+  const distro = rowsFromStmt((()=>{const s=db.prepare("SELECT distro, release, package, status, fixed_version FROM distro_status WHERE cve_id=?");s.bind([id]);return s;})());
+  const epssRow = rowsFromStmt((()=>{const s=db.prepare("SELECT epss_score, epss_percentile, score_date FROM epss_scores WHERE cve_id=?");s.bind([id]);return s;})())[0];
+  const cve = rowsFromStmt((()=>{const s=db.prepare("SELECT * FROM cves WHERE cve_id=?");s.bind([id]);return s;})())[0];
+  return { cve, cwes, exploits, distro, epssRow };
+}
+
+function render(){
+  const q = document.getElementById('q').value.trim();
+  if(!q){ document.getElementById('results').innerHTML=''; document.getElementById('detail').innerHTML=''; return; }
+  let matches = [];
+  try{ matches = search(q); }catch(e){ matches = []; }
+  const resultsEl = document.getElementById('results');
+  if(matches.length===0){
+    resultsEl.innerHTML = `<div class="empty">No matches for "${q}"</div>`;
+    document.getElementById('detail').innerHTML='';
+    return;
+  }
+  resultsEl.innerHTML = matches.map(d => `
+    <div class="row ${d.cve_id===activeId?'active':''}" data-id="${d.cve_id}">
+      <div class="row-top">
+        <span class="cve-id">${d.cve_id}</span>
+        <div class="badges">
+          ${d.in_kev ? '<span class="badge" style="background:#fca5a5;color:#7f1d1d">KEV</span>' : ''}
+          ${sevBadge(d.severity)}
+          ${d.epss_score!=null ? epssBadge(d.epss_score) : ''}
+        </div>
+      </div>
+      <div class="desc">${d.description||''}</div>
+    </div>
+  `).join('');
+  resultsEl.querySelectorAll('.row').forEach(r=>{
+    r.addEventListener('click', ()=>{ activeId = r.dataset.id; render(); showDetail(activeId); });
+  });
+  if(!activeId || !matches.some(m=>m.cve_id===activeId)) activeId = matches[0].cve_id;
+  showDetail(activeId);
+}
+
+function showDetail(id){
+  const { cve, cwes, exploits, distro, epssRow } = detailQuery(id);
+  const cweHtml = cwes.map(c=>`<span class="badge" style="background:#1f2937;color:#93c5fd;border:1px solid #30363d">${c.cwe_id} ${c.name||''}</span>`).join(' ') || '<span style="color:var(--muted);font-size:12px">None recorded</span>';
+  const exploitRows = exploits.length ? exploits.map(e=>`<tr><td>${e.source}</td><td><code>${e.reference}</code></td></tr>`).join('') :
+    `<tr><td colspan="2" style="color:var(--muted)">No public exploit found in sources</td></tr>`;
+  const distroRows = distro.length ? distro.map(x=>`<tr><td>${x.distro}</td><td>${x.release}</td><td><code>${x.package}</code></td><td>${statusBadge(x.status)}</td><td><code>${x.fixed_version}</code></td></tr>`).join('') :
+    `<tr><td colspan="5" style="color:var(--muted)">No distro package status recorded</td></tr>`;
+  const inKev = exploits.some(e=>e.source==='cisa_kev');
+
+  document.getElementById('detail').innerHTML = `
+    <div class="detail">
+      ${inKev ? `<div class="kev-note">This CVE is on the CISA Known Exploited Vulnerabilities list - treat as actively exploited, not theoretical.</div>` : ''}
+      <div class="grid">
+        <div class="cell"><div class="cell-label">Severity</div><div class="cell-val">${sevBadge(cve.severity)}</div></div>
+        <div class="cell"><div class="cell-label">CVSS score</div><div class="cell-val">${cve.cvss_score ?? '-'}</div></div>
+        <div class="cell"><div class="cell-label">EPSS</div><div class="cell-val">${epssRow ? (epssRow.epss_score*100).toFixed(1)+'%' : '-'}</div></div>
+        <div class="cell"><div class="cell-label">Published</div><div class="cell-val" style="font-family:var(--font-mono);font-size:12px">${(cve.published||'').slice(0,10)}</div></div>
+        <div class="cell"><div class="cell-label">Last modified</div><div class="cell-val" style="font-family:var(--font-mono);font-size:12px">${(cve.last_modified||'').slice(0,10)}</div></div>
+      </div>
+      <div class="section-h">Description</div>
+      <div class="desc-block">${cve.description||''}</div>
+      <div class="section-h">Weakness (CWE)</div>
+      <div>${cweHtml}</div>
+      <div class="section-h">Public exploits</div>
+      <table><thead><tr><th>Source</th><th>Reference</th></tr></thead><tbody>${exploitRows}</tbody></table>
+      <div class="section-h">Distro package status</div>
+      <table><thead><tr><th>Distro</th><th>Release</th><th>Package</th><th>Status</th><th>Fixed version</th></tr></thead><tbody>${distroRows}</tbody></table>
+    </div>
+  `;
+}
+
+async function init(){
+  const statusEl = document.getElementById('status');
+  try{
+    const SQL = await initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}` });
+
+    // version.json is small and never cached, so we always know if new data exists
+    const versionResp = await fetch('version.json', { cache: 'no-store' });
+    const versionInfo = await versionResp.json();
+    const cachedVersion = localStorage.getItem('cve_db_version');
+
+    statusEl.textContent = `Loading database (${versionInfo.cve_count} CVEs, updated ${versionInfo.updated_at})...`;
+
+    // cache-bust with the version string so a changed DB is never served stale
+    const dbResp = await fetch(`cve.sqlite.gz?v=${versionInfo.version}`);
+    const compressed = new Uint8Array(await dbResp.arrayBuffer());
+    const bytes = pako.inflate(compressed);
+    db = new SQL.Database(bytes);
+    localStorage.setItem('cve_db_version', versionInfo.version);
+
+    statusEl.textContent = `Ready - ${versionInfo.cve_count} CVEs, last updated ${versionInfo.updated_at}`;
+    statusEl.className = 'status ready';
+    const input = document.getElementById('q');
+    input.disabled = false;
+    input.addEventListener('input', render);
+  }catch(err){
+    statusEl.textContent = 'Failed to load database: ' + err.message;
+    statusEl.className = 'status error';
+  }
+}
+init();
+</script>
+</body>
+</html>
