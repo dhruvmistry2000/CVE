@@ -1,7 +1,7 @@
 {
-  "version": "20261113233903",
-  "updated_at": "2026-11-13T23:39:03Z",
-  "cve_count": 45,
-  "cve_ids_requested": 45,
+  "version": "20261114221307",
+  "updated_at": "2026-11-14T22:13:07Z",
+  "cve_count": 5,
+  "cve_ids_requested": 5,
   "cve_ids_missing": []
 }
